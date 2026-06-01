@@ -1,0 +1,21 @@
+# Build artifacts (PyInstaller)
+build/
+dist/
+*.spec
+build_log.txt
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Runtime data & pengaturan portable
+data/
+photo_organizer.ini
+
+# File sementara / scratch
+_smoketest*.py
+_*.png
+_*.html
