@@ -9,7 +9,8 @@ import webbrowser
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QSize, QSettings
-from PySide6.QtGui import QAction, QIcon, QPixmap, QKeySequence, QShortcut
+from PySide6.QtGui import (QAction, QIcon, QPixmap, QKeySequence, QShortcut,
+                           QColor)
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QFileDialog, QHBoxLayout,
     QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMenu,
@@ -32,7 +33,7 @@ from .widgets import (AboutDialog, FolderManagerDialog, HelpDialog,
                       OrganizeDialog, RenameDialog, SettingsDialog, StarRating)
 from .resources import asset_path, default_data_dir, portable_settings
 from .workers import (ScanWorker, ThumbnailWorker, FaceWorker, GeocodeWorker,
-                      QualityWorker)
+                      QualityWorker, DuplicateWorker, MapPrepWorker)
 
 try:
     from send2trash import send2trash as _send2trash
@@ -47,6 +48,56 @@ def _placeholder_icon() -> QIcon:
     pix = QPixmap(THUMB_SIZE[0], THUMB_SIZE[1])
     pix.fill(Qt.lightGray)
     return QIcon(pix)
+
+
+_BULAN = ["", "Januari", "Februari", "Maret", "April", "Mei", "Juni", "Juli",
+          "Agustus", "September", "Oktober", "November", "Desember"]
+
+
+def _month_key(date_str):
+    """(tahun, bulan) dari 'YYYY-MM-DD ...', atau None bila tak ada tanggal."""
+    if not date_str or len(str(date_str)) < 7:
+        return None
+    try:
+        return (int(str(date_str)[0:4]), int(str(date_str)[5:7]))
+    except ValueError:
+        return None
+
+
+def _month_label(date_str) -> str:
+    k = _month_key(date_str)
+    if not k:
+        return "Tanpa tanggal"
+    y, m = k
+    return f"{_BULAN[m]} {y}" if 1 <= m <= 12 else f"{y}"
+
+
+class GalleryList(QListWidget):
+    """QListWidget IconMode dengan dukungan baris header lebar-penuh (pemisah)."""
+
+    HEADER_ROLE = Qt.UserRole + 2
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._headers: list = []
+
+    def clear(self):
+        self._headers = []
+        super().clear()
+
+    def add_header(self, item: QListWidgetItem):
+        self._headers.append(item)
+        self.addItem(item)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self.relayout_headers()
+
+    def relayout_headers(self):
+        w = max(self.viewport().width() - 4, 80)
+        for it in self._headers:
+            sh = it.sizeHint()
+            it.setSizeHint(QSize(w, sh.height() if sh.height() > 0 else 44))
 
 
 class DuplicatesDialog(QDialog):
@@ -101,6 +152,11 @@ class DuplicatesDialog(QDialog):
         split.setStretchFactor(0, 3)
         split.setStretchFactor(1, 2)
 
+        # Bangun pohon cepat dengan placeholder; thumbnail dimuat di latar.
+        self.thumb_worker = None
+        placeholder = _placeholder_icon()
+        self._thumb_items: list = []
+        jobs: list[tuple[int, str]] = []
         for gi, group in enumerate(groups, 1):
             top = QTreeWidgetItem([f"Grup {gi} — {len(group)} foto"])
             top.setFirstColumnSpanned(True)
@@ -115,13 +171,18 @@ class DuplicatesDialog(QDialog):
                 ])
                 child.setData(0, Qt.UserRole, photo)
                 child.setFlags(child.flags() | Qt.ItemIsUserCheckable)
-                # Biarkan file terbesar (idx 0) tidak dicentang.
-                child.setCheckState(0, Qt.Unchecked if idx == 0 else Qt.Unchecked)
-                thumb = get_thumbnail(Path(photo["path"]), self.cache_dir)
-                if thumb:
-                    child.setIcon(0, QIcon(str(thumb)))
+                child.setCheckState(0, Qt.Unchecked)   # default tak dicentang
+                child.setIcon(0, placeholder)
                 top.addChild(child)
+                jobs.append((len(self._thumb_items), photo["path"]))
+                self._thumb_items.append(child)
             top.setExpanded(True)
+
+        if jobs:
+            self.thumb_worker = ThumbnailWorker(jobs, self.cache_dir)
+            self.thumb_worker.thumb_ready.connect(self._set_thumb)
+            self.thumb_worker.start()
+        self.finished.connect(self._stop_thumb)
 
         btns = QHBoxLayout()
         select_extra = QPushButton("Centang semua kecuali yang terbesar")
@@ -159,6 +220,15 @@ class DuplicatesDialog(QDialog):
         self.preview_info.setText(
             f"<b>{photo['filename']}</b><br>{dim} • {size_kb:,.0f} KB<br>"
             f"<span style='color:#888'>{photo['path']}</span>")
+
+    def _set_thumb(self, idx: int, thumb_path: str):
+        if 0 <= idx < len(self._thumb_items):
+            self._thumb_items[idx].setIcon(0, QIcon(thumb_path))
+
+    def _stop_thumb(self, *_):
+        if self.thumb_worker and self.thumb_worker.isRunning():
+            self.thumb_worker.stop()
+            self.thumb_worker.wait(2000)
 
     def _check_extras(self):
         for i in range(self.tree.topLevelItemCount()):
@@ -246,15 +316,19 @@ class JunkDialog(QDialog):
         split.setStretchFactor(0, 3)
         split.setStretchFactor(1, 2)
 
-        for r in results:
+        # Bangun daftar cepat dengan ikon placeholder; thumbnail dimuat di latar
+        # agar UI tidak membeku saat hasilnya ribuan.
+        self.thumb_worker = None
+        placeholder = _placeholder_icon()
+        jobs: list[tuple[int, str]] = []
+        for idx, r in enumerate(results):
             item = QTreeWidgetItem([r["filename"], ", ".join(r["reasons"])])
             item.setData(0, Qt.UserRole, r)
             item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
             item.setCheckState(0, Qt.Checked)      # default tercentang
-            thumb = get_thumbnail(Path(r["path"]), self.cache_dir)
-            if thumb:
-                item.setIcon(0, QIcon(str(thumb)))
+            item.setIcon(0, placeholder)
             self.tree.addTopLevelItem(item)
+            jobs.append((idx, r["path"]))
 
         btns = QHBoxLayout()
         check_all = QPushButton("Centang semua")
@@ -272,6 +346,23 @@ class JunkDialog(QDialog):
         btns.addWidget(move_btn)
         btns.addWidget(close_btn)
         layout.addLayout(btns)
+
+        # Muat thumbnail di latar belakang (jangan blokir UI).
+        if jobs:
+            self.thumb_worker = ThumbnailWorker(jobs, self.cache_dir)
+            self.thumb_worker.thumb_ready.connect(self._set_thumb)
+            self.thumb_worker.start()
+        self.finished.connect(self._stop_thumb)
+
+    def _set_thumb(self, idx: int, thumb_path: str):
+        it = self.tree.topLevelItem(idx)
+        if it:
+            it.setIcon(0, QIcon(thumb_path))
+
+    def _stop_thumb(self, *_):
+        if self.thumb_worker and self.thumb_worker.isRunning():
+            self.thumb_worker.stop()
+            self.thumb_worker.wait(2000)
 
     def _on_current(self, current, _prev):
         if not current:
@@ -394,6 +485,8 @@ class MainWindow(QMainWindow):
         self.face_worker: FaceWorker | None = None
         self.geo_worker: GeocodeWorker | None = None
         self.quality_worker: QualityWorker | None = None
+        self.dup_worker: DuplicateWorker | None = None
+        self.map_worker: MapPrepWorker | None = None
         self._geo_attempted: set = set()
         self.current_photo: dict | None = None
         # Filter aktif dari sidebar: {"kind": ...}
@@ -424,14 +517,16 @@ class MainWindow(QMainWindow):
         cv.addWidget(self.filter_bar)
         cv.addWidget(self._build_staging_bar())
 
-        self.gallery = QListWidget()
+        self.gallery = GalleryList()
         self.gallery.setObjectName("Gallery")
         self.gallery.setViewMode(QListWidget.IconMode)
         self.gallery.setIconSize(QSize(self.icon_px, self.icon_px))
         self.gallery.setResizeMode(QListWidget.Adjust)
         self.gallery.setMovement(QListWidget.Static)
         self.gallery.setSpacing(8)
-        self.gallery.setUniformItemSizes(True)
+        self.gallery.setWordWrap(True)
+        # uniformItemSizes harus False agar baris header bisa lebar-penuh.
+        self.gallery.setUniformItemSizes(False)
         self.gallery.setSelectionMode(QListWidget.ExtendedSelection)
         self.gallery.itemSelectionChanged.connect(self._on_selection_changed)
         self.gallery.itemDoubleClicked.connect(self._open_external)
@@ -804,36 +899,34 @@ class MainWindow(QMainWindow):
 
     # ----------------------------------------------------------- lokasi/peta
     def open_map(self):
-        rows = self.db.photos_with_gps()
-        if not rows:
+        if self.map_worker and self.map_worker.isRunning():
+            return
+        n = self.db.gps_count()
+        if n == 0:
             QMessageBox.information(
                 self, APP_NAME,
                 "Belum ada foto dengan data lokasi (GPS) di EXIF.\n"
                 "Foto dari kamera HP biasanya punya GPS bila layanan lokasi aktif.")
             return
-        rows = rows[:3000]                  # batasi agar HTML tetap ringan
-        thumb_cap = 1500                    # batas pembuatan thumbnail baru
-        QApplication.setOverrideCursor(Qt.WaitCursor)
-        self.status.showMessage("Menyiapkan thumbnail peta…")
-        QApplication.processEvents()
-        points = []
-        try:
-            for i, r in enumerate(rows):
-                # Buat thumbnail bila belum ada (agar pin tampil sebagai foto).
-                if i < thumb_cap:
-                    thumb = get_thumbnail(Path(r["path"]), self.cache_dir)
-                else:
-                    thumb = cached_thumbnail(Path(r["path"]), self.cache_dir)
-                place = self.db.geocache_get(
-                    f"{round(r['lat'], 2)},{round(r['lon'], 2)}")
-                points.append({
-                    "lat": r["lat"], "lon": r["lon"], "name": r["filename"],
-                    "date": r["date_taken"], "place": place,
-                    "thumb": str(thumb) if thumb else None,
-                    "full": r["path"],          # foto asli untuk popup
-                })
-        finally:
-            QApplication.restoreOverrideCursor()
+        # Siapkan titik (thumbnail + nama tempat) di latar -> UI tetap responsif.
+        self.progress.show()
+        self.progress.setRange(0, min(n, 3000))
+        self.status.showMessage("Menyiapkan peta…")
+        self.map_worker = MapPrepWorker(self.db, self.cache_dir, limit=3000)
+        self.map_worker.progress.connect(self._on_map_progress)
+        self.map_worker.finished_map.connect(self._on_map_ready)
+        self.map_worker.start()
+
+    def _on_map_progress(self, cur: int, total: int):
+        self.progress.setRange(0, total)
+        self.progress.setValue(cur)
+        self.status.showMessage(f"Menyiapkan peta {cur}/{total}…")
+
+    def _on_map_ready(self, points: list):
+        self.progress.hide()
+        self.status.clearMessage()
+        if not points:
+            return
         out = build_map_html(points, "Peta Foto")
         try:
             MapDialog(out, self).exec()
@@ -913,18 +1006,44 @@ class MainWindow(QMainWindow):
         )
         self.gallery.clear()
 
+        # Pemisah per bulan/tahun hanya saat diurutkan berdasarkan tanggal.
+        order = self.sort_combo.currentData() or ""
+        date_sorted = order.startswith("date_taken")
+
         thumb_jobs: list[tuple[int, str]] = []
-        for idx, row in enumerate(rows):
+        last_key = object()
+        for row in rows:
             photo = dict(row)
+            if date_sorted:
+                key = _month_key(photo.get("date_taken"))
+                if key != last_key:
+                    self._add_date_header(_month_label(photo.get("date_taken")))
+                    last_key = key
             item = QListWidgetItem(self.placeholder, photo["filename"])
             item.setData(PHOTO_ROLE, photo)
             item.setSizeHint(QSize(self.icon_px + 20, self.icon_px + 40))
             item.setToolTip(f"{photo['filename']}\n{photo.get('date_taken','')}")
             self.gallery.addItem(item)
-            thumb_jobs.append((idx, photo["path"]))
+            thumb_jobs.append((self.gallery.count() - 1, photo["path"]))
 
+        self.gallery.relayout_headers()
         self.status.showMessage(f"{len(rows)} media ditampilkan.")
         self._start_thumbnails(thumb_jobs)
+
+    def _add_date_header(self, label: str):
+        h = QListWidgetItem(f"  📅  {label}")
+        h.setData(GalleryList.HEADER_ROLE, True)
+        h.setFlags(Qt.NoItemFlags)             # tidak bisa dipilih
+        font = h.font()
+        font.setBold(True)
+        font.setPointSize(font.pointSize() + 2)
+        h.setFont(font)
+        h.setForeground(QColor("#e7e8ea"))
+        h.setBackground(QColor("#262730"))
+        h.setTextAlignment(Qt.AlignVCenter | Qt.AlignLeft)
+        w = max(self.gallery.viewport().width() - 4, 80)
+        h.setSizeHint(QSize(w, 44))
+        self.gallery.add_header(h)
 
     def _start_thumbnails(self, jobs: list[tuple[int, str]]):
         if self.thumb_worker and self.thumb_worker.isRunning():
@@ -957,7 +1076,8 @@ class MainWindow(QMainWindow):
 
     # ------------------------------------------------------------- detail
     def _selected_photos(self) -> list[dict]:
-        return [it.data(PHOTO_ROLE) for it in self.gallery.selectedItems()]
+        return [p for p in (it.data(PHOTO_ROLE)
+                            for it in self.gallery.selectedItems()) if p]
 
     def _on_selection_changed(self):
         photos = self._selected_photos()
@@ -1067,8 +1187,9 @@ class MainWindow(QMainWindow):
         selected = self._selected_photos()
         if selected:
             return selected
-        return [self.gallery.item(i).data(PHOTO_ROLE)
-                for i in range(self.gallery.count())]
+        # Lewati baris header (data PHOTO_ROLE bernilai None).
+        return [p for p in (self.gallery.item(i).data(PHOTO_ROLE)
+                            for i in range(self.gallery.count())) if p]
 
     def organize_dialog(self):
         targets = self._targets_for_operation()
@@ -1082,8 +1203,15 @@ class MainWindow(QMainWindow):
         if not vals["target"]:
             QMessageBox.warning(self, APP_NAME, "Folder tujuan belum dipilih.")
             return
-        moved = organize_by_date(
-            targets, Path(vals["target"]), vals["pattern"], vals["move"])
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            moved = organize_by_date(
+                targets, Path(vals["target"]), vals["pattern"], vals["move"],
+                progress=lambda c, t, n: (
+                    self.status.showMessage(f"Menyusun {c}/{t}: {n}"),
+                    QApplication.processEvents()))
+        finally:
+            QApplication.restoreOverrideCursor()
         if vals["move"]:
             for pid, _old, new in moved:
                 self.db.update_path(pid, new)
@@ -1103,7 +1231,15 @@ class MainWindow(QMainWindow):
         if dlg.exec() != QDialog.Accepted:
             return
         vals = dlg.values()
-        renamed = bulk_rename(targets, vals["template"], vals["start"])
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            renamed = bulk_rename(
+                targets, vals["template"], vals["start"],
+                progress=lambda c, t, n: (
+                    self.status.showMessage(f"Ganti nama {c}/{t}: {n}"),
+                    QApplication.processEvents()))
+        finally:
+            QApplication.restoreOverrideCursor()
         for pid, _old, new in renamed:
             self.db.update_path(pid, new)
         self.db.commit()
@@ -1112,14 +1248,17 @@ class MainWindow(QMainWindow):
             self, APP_NAME, f"{len(renamed)} foto berhasil diganti namanya.")
 
     def find_duplicates(self):
-        rows = self.db.all_with_phash()
-        if not rows:
-            QMessageBox.information(
-                self, APP_NAME, "Belum ada foto terindeks. Tambah folder dulu.")
+        if self.dup_worker and self.dup_worker.isRunning():
             return
+        self.progress.show()
+        self.progress.setRange(0, 0)          # indeterminator (busy)
         self.status.showMessage("Menganalisis duplikat…")
-        QApplication.processEvents()
-        groups = find_duplicate_groups(rows, threshold=5)
+        self.dup_worker = DuplicateWorker(self.db, threshold=5)
+        self.dup_worker.finished_dups.connect(self._on_dups_done)
+        self.dup_worker.start()
+
+    def _on_dups_done(self, groups: list):
+        self.progress.hide()
         self.status.clearMessage()
         if not groups:
             QMessageBox.information(
@@ -1542,7 +1681,8 @@ class MainWindow(QMainWindow):
     # ----------------------------------------------------------- penyimpanan
     def _stop_workers(self):
         for w in (self.thumb_worker, self.scan_worker, self.face_worker,
-                  self.geo_worker, self.quality_worker):
+                  self.geo_worker, self.quality_worker, self.dup_worker,
+                  self.map_worker):
             if w and w.isRunning():
                 w.stop()
                 w.wait(3000)
@@ -1670,19 +1810,24 @@ class MainWindow(QMainWindow):
     def clear_thumbnail_cache(self) -> int:
         """Hapus semua thumbnail di cache. Kembalikan jumlah berkas dihapus."""
         n = 0
-        if self.cache_dir.exists():
-            for f in self.cache_dir.glob("*.jpg"):
-                try:
-                    f.unlink()
-                    n += 1
-                except OSError:
-                    pass
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            if self.cache_dir.exists():
+                for f in self.cache_dir.glob("*.jpg"):
+                    try:
+                        f.unlink()
+                        n += 1
+                    except OSError:
+                        pass
+        finally:
+            QApplication.restoreOverrideCursor()
         return n
 
     def reset_index(self):
         """Hentikan worker, kosongkan indeks DB, dan bersihkan cache thumbnail."""
         for w in (self.thumb_worker, self.scan_worker, self.face_worker,
-                  self.geo_worker, self.quality_worker):
+                  self.geo_worker, self.quality_worker, self.dup_worker,
+                  self.map_worker):
             if w and w.isRunning():
                 w.stop()
                 w.wait(3000)
@@ -1727,7 +1872,8 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         for w in (self.thumb_worker, self.scan_worker, self.face_worker,
-                  self.geo_worker, self.quality_worker):
+                  self.geo_worker, self.quality_worker, self.dup_worker,
+                  self.map_worker):
             if w and w.isRunning():
                 w.stop()
                 w.wait(3000)

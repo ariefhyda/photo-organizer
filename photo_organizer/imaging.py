@@ -11,6 +11,10 @@ import imagehash
 from PIL import Image, ImageOps, UnidentifiedImageError
 from PIL.ExifTags import TAGS
 
+# Jangan gagalkan gambar beresolusi sangat besar (mis. panorama) dengan
+# DecompressionBombError; aplikasi lokal jadi izinkan ukuran besar.
+Image.MAX_IMAGE_PIXELS = None
+
 SUPPORTED_EXT = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff", ".tif",
                  ".webp", ".heic", ".heif"}
 VIDEO_EXT = {".mp4", ".mov", ".avi", ".mkv", ".wmv", ".m4v", ".3gp",
@@ -110,7 +114,7 @@ def extract_metadata(path: Path) -> dict:
                 result["phash"] = str(imagehash.phash(small))
             except Exception:
                 pass
-    except (UnidentifiedImageError, OSError, ValueError):
+    except Exception:        # noqa: BLE001 - file rusak/format aneh: pakai fallback
         pass
 
     if not result["date_taken"]:
@@ -223,7 +227,7 @@ def get_thumbnail(path: Path, cache_dir: Path) -> Optional[Path]:
             img.thumbnail(THUMB_SIZE, Image.LANCZOS)
             img.save(thumb_path, "JPEG", quality=82)
         return thumb_path
-    except (UnidentifiedImageError, OSError, ValueError):
+    except Exception:        # noqa: BLE001
         return None
 
 

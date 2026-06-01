@@ -40,41 +40,46 @@ class ScanWorker(QThread):
                         files.append(p)
 
         total = len(files)
-        seen_paths: set[str] = set()
         for i, path in enumerate(files, 1):
             if self._stop:
                 break
             sp = str(path)
-            seen_paths.add(sp)
+            # Proses tiap file dipagari try/except: satu file rusak tidak
+            # boleh menghentikan seluruh pemindaian.
             try:
                 mtime = path.stat().st_mtime
                 size = path.stat().st_size
-            except OSError:
-                continue
-
-            if self.db.get_photo_mtime(sp) != mtime:
-                if is_video(path):
-                    meta = extract_video_metadata(path)
-                    media_type = "video"
+                if self.db.get_photo_mtime(sp) != mtime:
+                    if is_video(path):
+                        meta = extract_video_metadata(path)
+                        media_type = "video"
+                    else:
+                        meta = extract_metadata(path)
+                        media_type = "photo"
+                    meta.setdefault("duration", None)
+                    self.db.upsert_photo({
+                        "path": sp,
+                        "filename": path.name,
+                        "size": size,
+                        "mtime": mtime,
+                        "media_type": media_type,
+                        "source": classify(sp),
+                        **meta,
+                    })
                 else:
-                    meta = extract_metadata(path)
-                    media_type = "photo"
-                meta.setdefault("duration", None)
-                self.db.upsert_photo({
-                    "path": sp,
-                    "filename": path.name,
-                    "size": size,
-                    "mtime": mtime,
-                    "media_type": media_type,
-                    "source": classify(sp),
-                    **meta,
-                })
-            else:
-                # Backfill ringan untuk record lama tanpa kolom sumber.
-                self.db.ensure_source(
-                    sp, classify(sp),
-                    "video" if is_video(path) else "photo")
-            self.progress.emit(i, total, path.name)
+                    self.db.ensure_source(
+                        sp, classify(sp),
+                        "video" if is_video(path) else "photo")
+            except Exception:           # noqa: BLE001 - lewati file bermasalah
+                pass
+            # Commit berkala agar progres tersimpan (bisa lanjut bila terhenti).
+            if i % 200 == 0:
+                try:
+                    self.db.commit()
+                except Exception:       # noqa: BLE001
+                    pass
+            if i % 50 == 0 or i == total:   # throttle sinyal progress
+                self.progress.emit(i, total, path.name)
 
         self.db.commit()
         self.finished_scan.emit(total)
@@ -205,8 +210,66 @@ class QualityWorker(QThread):
             if reasons:
                 out.append({"id": r["id"], "path": r["path"],
                             "filename": r["filename"], "reasons": reasons})
-            self.progress.emit(i, total, r["filename"])
+            if i % 50 == 0 or i == total:      # throttle agar UI tak banjir sinyal
+                self.progress.emit(i, total, r["filename"])
         self.finished_quality.emit(out)
+
+
+class MapPrepWorker(QThread):
+    """Siapkan titik peta (thumbnail + nama tempat) di latar agar UI tak beku."""
+
+    progress = Signal(int, int)      # current, total
+    finished_map = Signal(list)      # list titik {lat,lon,name,date,place,thumb,full}
+
+    def __init__(self, db: Database, cache_dir: Path, limit: int = 3000):
+        super().__init__()
+        self.db = db
+        self.cache_dir = cache_dir
+        self.limit = limit
+        self._stop = False
+
+    def stop(self):
+        self._stop = True
+
+    def run(self):
+        rows = self.db.photos_with_gps()[: self.limit]
+        total = len(rows)
+        pts = []
+        for i, r in enumerate(rows, 1):
+            if self._stop:
+                break
+            thumb = get_thumbnail(Path(r["path"]), self.cache_dir)
+            place = self.db.geocache_get(
+                f"{round(r['lat'], 2)},{round(r['lon'], 2)}")
+            pts.append({
+                "lat": r["lat"], "lon": r["lon"], "name": r["filename"],
+                "date": r["date_taken"], "place": place,
+                "thumb": str(thumb) if thumb else None, "full": r["path"],
+            })
+            if i % 20 == 0 or i == total:
+                self.progress.emit(i, total)
+        self.finished_map.emit(pts)
+
+
+class DuplicateWorker(QThread):
+    """Hitung grup foto duplikat di latar belakang (analisis bisa berat)."""
+
+    finished_dups = Signal(list)     # list grup
+
+    def __init__(self, db: Database, threshold: int = 5):
+        super().__init__()
+        self.db = db
+        self.threshold = threshold
+        self._stop = False
+
+    def stop(self):
+        self._stop = True
+
+    def run(self):
+        from .duplicates import find_duplicate_groups
+        rows = self.db.all_with_phash()
+        groups = find_duplicate_groups(rows, threshold=self.threshold)
+        self.finished_dups.emit(groups)
 
 
 class GeocodeWorker(QThread):
